@@ -10,23 +10,23 @@ def get_ar_prior(prior_set='medium'):
         'weak': {
             'phi_mean': 0.0,
             'phi_std': 1.0,
-            'sigma2_alpha': 2.0,
+            'sigma2_alpha': 1.0,
             'sigma2_beta': 1.0,
             'description': 'Weak (diffuse)'
         },
         'medium': {
-            'phi_mean': 0.3,
+            'phi_mean': 0.0,
             'phi_std': 0.2,
-            'sigma2_alpha': 3.0,
-            'sigma2_beta': 0.5,
-            'description': 'Medium (moderate belief in mean-reversion)'
+            'sigma2_alpha': 10.0,
+            'sigma2_beta': 10.0,
+            'description': 'Medium'
         },
         'informative': {
-            'phi_mean': 0.35,
+            'phi_mean': 0.0,
             'phi_std': 0.1,
-            'sigma2_alpha': 5.0,
-            'sigma2_beta': 0.3,
-            'description': 'Informative (strong belief in φ≈0.35)'
+            'sigma2_alpha': 100.0,
+            'sigma2_beta': 100.0,
+            'description': 'Informative '
         }
     }
     return priors[prior_set]
@@ -152,54 +152,17 @@ def fit_ar_bayesian(train_data, prior_set='medium', n_samples=5000, n_burnin=100
         'method': 'bayes'
     }
 
-
-def forecast_ar_multihorizon(last_train, test_data, phi, horizons=[1, 5, 22]):
-    """
-    Generate multi-horizon forecasts
-    
-    horizons: list of forecast lengths
-    Returns: dict with forecasts for each horizon
-    """
-    forecasts = {}
-    
-    for h in horizons:
-        if h == 1:
-            # 1-step: use last training observation
-            fc = np.array([phi * last_train])
-        else:
-            # h-step: recursive forecasting
-            fc = np.zeros(h)
-            fc[0] = phi * last_train
-            for t in range(1, h):
-                fc[t] = phi * fc[t-1]
-        
-        # Truncate to actual test length
-        actual = test_data[:h]
-        mse = np.mean((actual - fc[:len(actual)]) ** 2)
-        mae = np.mean(np.abs(actual - fc[:len(actual)]))
-        
-        forecasts[f'h_{h}'] = {
-            'forecast': fc[:len(actual)],
-            'actual': actual,
-            'mse': float(mse),
-            'mae': float(mae),
-            'rmse': float(np.sqrt(mse))
-        }
-    
-    return forecasts
-
 def gibbs_ar1_hierarchical(data_dict, n_samples=5000, n_burnin=1000):
     """
-    Gibbs sampler for hierarchical AR(1)
+    Gibbs sampler for hierarchical AR(1) with INFORMATIVE priors
+    
+    Equivalent to: φ_k ~ N(0, 0.1²) for each stock
+                   σ²_k ~ Gamma(100, 100)
     
     data_dict: {'AAPL': array, 'MSFT': array, ...}
-    
-    Returns:
-      - Individual phi samples for each stock
-      - Group-level hyperparameter samples
     """
     stocks = list(data_dict.keys())
-    K = len(stocks)  # number of stocks
+    K = len(stocks)
     
     # Initialize
     phi_samples = {stock: np.zeros(n_samples) for stock in stocks}
@@ -208,29 +171,51 @@ def gibbs_ar1_hierarchical(data_dict, n_samples=5000, n_burnin=1000):
     tau_phi_samples = np.zeros(n_samples)
     
     # Initial values
-    phi = {stock: 0.3 for stock in stocks}
+    phi = {stock: 0.0 for stock in stocks}
     sigma2 = {stock: np.var(data_dict[stock]) for stock in stocks}
-    mu_phi = 0.3
-    tau_phi = 0.1
+    mu_phi = 0.0
+    tau_phi = 0.05  # ← TIGHTER: was 0.1, now 0.05 (strong pooling)
+    
+    # PRIOR HYPERPARAMETERS (informative)
+    prior_mu_phi_mean = 0.0
+    prior_mu_phi_var = 0.01  # ← TIGHT: was 100, now 0.01 (equiv to σ=0.1)
+    prior_tau_phi_shape = 100.0  # ← STRONG: was 2, now 100 (tight around mode)
+    prior_tau_phi_rate = 100.0   # ← STRONG: was 1, now 100
+    
+    # ====================================================================
+    # ALTERNATIVE: Directly control σ²_k prior to match non-hierarchical
+    # ====================================================================
+    prior_sigma2_alpha = 100.0  # ← MATCH non-hierarchical
+    prior_sigma2_beta = 100.0   # ← MATCH non-hierarchical
+    
+    print(f"Informative Hierarchical AR(1) Priors:")
+    print(f"  φ group mean μ_φ: N(0, {prior_mu_phi_var})")
+    print(f"  φ group SD τ_φ²: Gamma({prior_tau_phi_shape}, {prior_tau_phi_rate})")
+    print(f"  σ²_k: Gamma({prior_sigma2_alpha}, {prior_sigma2_beta})")
+    print(f"  Initial τ_φ: {tau_phi}\n")
     
     # Gibbs loop
     for i in range(n_samples + n_burnin):
         
-        # Sample individual phi | sigma2, mu_phi, tau_phi
+        # ================================================================
+        # STEP 1: Sample individual φ_k | σ²_k, μ_φ, τ_φ
+        # ================================================================
         for stock in stocks:
             y = data_dict[stock]
             y_lag = y[:-1]
             y_curr = y[1:]
             n = len(y_curr)
             
-            # Posterior precision and mean
+            # Posterior precision and mean (from normal likelihood + normal prior)
             post_var_inv = (y_lag.T @ y_lag) / sigma2[stock] + 1 / (tau_phi ** 2)
             post_var = 1 / post_var_inv
             post_mean = post_var * ((y_lag.T @ y_curr) / sigma2[stock] + mu_phi / (tau_phi ** 2))
             
             phi[stock] = np.random.normal(post_mean, np.sqrt(post_var))
         
-        # Sample individual sigma2 | phi, y
+        # ================================================================
+        # STEP 2: Sample individual σ²_k | φ_k, y (with informative prior)
+        # ================================================================
         for stock in stocks:
             y = data_dict[stock]
             y_lag = y[:-1]
@@ -238,24 +223,39 @@ def gibbs_ar1_hierarchical(data_dict, n_samples=5000, n_burnin=1000):
             n = len(y_curr)
             
             residuals = y_curr - phi[stock] * y_lag
-            alpha_post = 2 + n / 2
-            beta_post = 1 + np.sum(residuals ** 2) / 2
+            
+            # INFORMATIVE PRIOR: Gamma(alpha_prior, beta_prior)
+            # Posterior: Gamma(alpha_prior + n/2, beta_prior + sum_sq/2)
+            alpha_post = prior_sigma2_alpha + n / 2
+            beta_post = prior_sigma2_beta + np.sum(residuals ** 2) / 2
             
             sigma2[stock] = np.random.gamma(alpha_post, 1 / beta_post)
         
-        # Sample group mean mu_phi | phi, tau_phi
+        # ================================================================
+        # STEP 3: Sample group mean μ_φ | φ_k, τ_φ (with tight prior)
+        # ================================================================
         phi_vals = np.array([phi[s] for s in stocks])
-        post_var_mu = 1 / (K / (tau_phi ** 2) + 1 / 10 ** 2)  # prior variance = 10
-        post_mean_mu = post_var_mu * (np.sum(phi_vals) / (tau_phi ** 2))
+        
+        # Posterior: inverse variance weighted average
+        post_var_mu = 1 / (K / (tau_phi ** 2) + 1 / prior_mu_phi_var)
+        post_mean_mu = post_var_mu * (np.sum(phi_vals) / (tau_phi ** 2) + 
+                                       prior_mu_phi_mean / prior_mu_phi_var)
         mu_phi = np.random.normal(post_mean_mu, np.sqrt(post_var_mu))
         
-        # Sample group SD tau_phi | phi, mu_phi
+        # ================================================================
+        # STEP 4: Sample group SD τ_φ | φ_k, μ_φ (with tight prior)
+        # ================================================================
         phi_vals = np.array([phi[s] for s in stocks])
         sum_sq = np.sum((phi_vals - mu_phi) ** 2)
-        alpha_tau = 2 + K / 2
-        beta_tau = 1 + sum_sq / 2
+        
+        # INFORMATIVE HYPERPRIOR: Gamma(shape, rate) on τ_φ²
+        # Posterior: Gamma(shape + K/2, rate + sum_sq/2)
+        alpha_tau = prior_tau_phi_shape + K / 2
+        beta_tau = prior_tau_phi_rate + sum_sq / 2
+        
         tau_phi = np.sqrt(np.random.gamma(alpha_tau, 1 / beta_tau))
         
+        # Store samples after burnin
         if i >= n_burnin:
             idx = i - n_burnin
             for stock in stocks:
@@ -270,8 +270,16 @@ def gibbs_ar1_hierarchical(data_dict, n_samples=5000, n_burnin=1000):
         'mu_phi_samples': mu_phi_samples,
         'tau_phi_samples': tau_phi_samples,
         'n_samples': n_samples,
-        'n_burnin': n_burnin
+        'n_burnin': n_burnin,
+        'prior_config': {
+            'prior_mu_phi_var': prior_mu_phi_var,
+            'prior_tau_phi_shape': prior_tau_phi_shape,
+            'prior_tau_phi_rate': prior_tau_phi_rate,
+            'prior_sigma2_alpha': prior_sigma2_alpha,
+            'prior_sigma2_beta': prior_sigma2_beta
+        }
     }
+
 
 def fit_ar_hierarchical(data_dict, n_samples=5000, n_burnin=1000):
     """
@@ -321,3 +329,140 @@ def fit_ar_hierarchical(data_dict, n_samples=5000, n_burnin=1000):
     }
     
     return results
+
+def forecast_ar_multihorizon_point(last_train, test_data, phi, horizons=[1, 5, 22]):
+    forecasts = {}
+    
+    for h in horizons:
+        if h == 1:
+            fc = np.array([phi * last_train])
+        else:
+            fc = np.zeros(h)
+            fc[0] = phi * last_train
+            for t in range(1, h):
+                fc[t] = phi * fc[t-1]
+        
+        actual = test_data[:h]
+        mse = np.mean((actual - fc[:len(actual)]) ** 2)
+        mae = np.mean(np.abs(actual - fc[:len(actual)]))
+        
+        forecasts[f'h_{h}'] = {
+            'forecast': fc[:len(actual)],
+            'actual': actual,
+            'mse': float(mse),
+            'mae': float(mae),
+            'rmse': float(np.sqrt(mse))
+        }
+    
+    return forecasts
+
+
+def forecast_ar_posterior_predictive(last_train, test_data, phi_samples, 
+                                        sigma2_samples, horizons=[1, 5, 22], 
+                                        n_posterior_max=1000, max_phi_abs=0.999):
+    """
+    FIXED VERSION: Numerical stability + Prediction Interval Score (PIS)
+    
+    SAFEGUARDS:
+    1. Clip |φ| > 0.999 → 0.999 (prevent explosion)
+    2. Cap sigma2 at 99th percentile 
+    3. Limit recursion depth with damping for long horizons
+    4. Use proper PIS scoring
+    
+    PIS Formula (95% intervals, α=0.05):
+    PIS = (upper - lower) + (2/0.95) * [(lower - actual) if actual < lower else 0] 
+                        + (2/0.95) * [(actual - upper) if actual > upper else 0]
+    """
+    n_posterior = min(len(phi_samples), n_posterior_max)  # Subsample if too many
+    forecasts = {}
+    
+    # Preprocess: clip extreme parameters
+    phi_clipped = np.clip(np.abs(phi_samples[:n_posterior]), 0, max_phi_abs)
+    phi_clipped = np.sign(phi_samples[:n_posterior]) * phi_clipped
+    sigma2_clipped = np.clip(sigma2_samples[:n_posterior], 
+                           0, np.percentile(sigma2_samples, 99))
+    
+    for h in horizons:
+        # Generate stable forecasts
+        posterior_forecasts = np.zeros((n_posterior, h))
+        
+        for i in range(n_posterior):
+            phi = phi_clipped[i]
+            sigma2 = sigma2_clipped[i]
+            
+            current = last_train
+            damping_factor = 1.0  # Decay for stability in long horizons
+            
+            for t in range(h):
+                # Add damping for long horizons to prevent explosion
+                if t > 10:  # After 10 steps, dampen phi
+                    phi_effective = phi * 0.95 ** (t - 10)
+                else:
+                    phi_effective = phi
+                
+                noise = np.random.normal(0, np.sqrt(sigma2) * damping_factor)
+                current = phi_effective * current + noise
+                posterior_forecasts[i, t] = current
+                
+                # Additional safeguard: clip extreme values
+                if abs(current) > 10:  # Arbitrary reasonable bound for returns
+                    current *= 0.9  # Dampen
+                    posterior_forecasts[i, t] = current
+        
+        # Compute prediction intervals from posterior
+        forecast_mean = np.mean(posterior_forecasts, axis=0)
+        ci_lower = np.percentile(posterior_forecasts, 2.5, axis=0)
+        ci_upper = np.percentile(posterior_forecasts, 97.5, axis=0)
+        
+        # Truncate to test data length
+        max_test_len = min(h, len(test_data))
+        forecast_mean = forecast_mean[:max_test_len]
+        ci_lower = ci_lower[:max_test_len]
+        ci_upper = ci_upper[:max_test_len]
+        actual = test_data[:max_test_len]
+        
+        # ====== NEW: PREDICTION INTERVAL SCORE (PIS) ======
+        alpha = 0.05  # 95% intervals
+        pis_scores = []
+        
+        for t in range(len(actual)):
+            lower, upper, y = ci_lower[t], ci_upper[t], actual[t]
+            
+            if y < lower:
+                pis = (upper - lower) + (2/0.95) * (lower - y)
+            elif y > upper:
+                pis = (upper - lower) + (2/0.95) * (y - upper)
+            else:
+                pis = (upper - lower)
+            
+            pis_scores.append(pis)
+        
+        mean_pis = float(np.mean(pis_scores))
+        
+        # Traditional metrics
+        coverage = float(np.mean((actual >= ci_lower) & (actual <= ci_upper)))
+        mse = float(np.mean((actual - forecast_mean) ** 2))
+        
+        forecasts[f'h_{h}'] = {
+            'forecast_mean': forecast_mean.tolist(),
+            'ci_lower': ci_lower.tolist(),
+            'ci_upper': ci_upper.tolist(),
+            'actual': actual.tolist(),
+            'coverage': coverage,
+            'mse': mse,
+            'rmse': float(np.sqrt(mse)),
+            'interval_width': float(np.mean(ci_upper - ci_lower)),
+            'pis': mean_pis,  # NEW: Prediction Interval Score
+            'pis_per_step': pis_scores  # For diagnostics
+        }
+    
+    return forecasts
+
+
+def compute_pis_summary(forecasts_dict):
+    """Extract PIS from forecasts for table"""
+    pis_data = []
+    for h_key in ['h_1', 'h_5', 'h_22']:
+        if h_key in forecasts_dict:
+            pis_data.append(forecasts_dict[h_key]['pis'])
+    return pis_data
